@@ -1,0 +1,15 @@
+{
+  "poi_rows": 168,
+  "traveler_rows": 90,
+  "interaction_rows": 1800,
+  "interaction_signal": {
+    "view": 0.15,
+    "click": 0.3,
+    "save": 0.6,
+    "navigate": 0.75,
+    "visit": 0.9,
+    "booking": 1.0,
+    "dismiss": -0.7
+  },
+  "seed": 42
+}
