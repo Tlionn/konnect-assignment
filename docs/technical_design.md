@@ -2,186 +2,140 @@
 
 ## 1. Problem formulation
 
-For traveler `u`, trip context `c`, and destination POI catalog `P`, produce a ranked list of POIs with weights that represent downstream itinerary utility. The ranking should be personalized rather than popularity-driven and should distinguish user preference from practical feasibility.
+Given traveler `u`, trip context `c`, and destination POIs `P`, return a weighted ranking for downstream itinerary planning.
 
-The prototype uses two scores:
+The system separates:
 
-- **Preference score**: learned affinity between traveler/trip and POI.
-- **Context compatibility**: deterministic trip feasibility score using budget, mobility, party fit and availability.
+1. **Preference relevance** — likelihood the traveler meaningfully wants the POI.
+2. **Context compatibility** — whether it is practical for this trip.
 
-Final utility is:
+Final utility:
 
-`utility = (0.68 * preference + 0.32 * compatibility) * availability_guardrail`
+`final = (0.75 * preference + 0.25 * compatibility) * availability_guardrail`
 
-The weights are explicit prototype choices, not claimed business-optimal constants. In production they would be tuned from online/offline objectives and product constraints.
+## 2. Synthetic data
 
-## 2. Architecture
+The deterministic dataset contains:
 
-1. Data preparation and normalization
-2. POI/traveler feature construction
-3. Behavioral profile aggregation from historical interactions
-4. Candidate generation with a long-tail quota
-5. Learned preference ranking using gradient-boosted trees
-6. Contextual/practical scoring
-7. Final weighted ranking
-8. Explanation generation
-9. Offline evaluation
+- 168 POIs across Seoul and Busan
+- 90 travelers
+- 1,800 implicit feedback events
 
-This is intentionally a two-stage recommender. Candidate generation provides scalability; the ranker spends more compute only on a reduced candidate set.
+Signals:
 
-## 3. Data assumptions
+- view = 0.15
+- click = 0.30
+- save = 0.60
+- navigate = 0.75
+- visit = 0.90
+- booking = 1.00
+- dismiss = -0.70
 
-The submitted data is synthetic and deterministic. It contains two destinations, 168 POIs, 90 travelers and implicit-feedback events. POIs include category, tags, geography, price, ratings, review counts, popularity, localness, family suitability, transit/accessibility, duration, reservation and availability fields.
+Synthetic metrics demonstrate system behavior and evaluation mechanics; they are not claims of real-world business lift.
 
-Travelers include destination, trip duration, interests, budget, party type, mobility, and explicit preferences. Interactions include graded positive signals and dismissals.
+## 3. Feature engineering
 
-Synthetic labels are not evidence of real-world business lift; they exist to demonstrate a complete, reproducible ML pipeline and evaluation mechanics.
+POI features include quality, popularity, localness, price, transit/accessibility, duration, reservation friction and availability.
 
-## 4. Feature engineering
+Traveler/trip features include interests, explicit preference tags, budget, mobility, party type and trip duration.
 
-### POI features
+Pair features include interest match, preference overlap, budget/mobility/family fit, explicit local/famous interactions, historical category/tag affinities, and similarity to historical localness/popularity preferences.
 
-- rating and log-normalized review volume
-- popularity and inverse-popularity (long-tail)
-- localness
-- accessibility and transit score
-- expected visit duration
-- reservation friction and weekend availability
-- category/tags
+## 4. Leakage-safe behavioral history
 
-### Traveler/trip features
+Training interactions are processed chronologically per traveler.
 
-- explicit interests
-- explicit textual preference tags
-- budget
-- mobility
-- party type
-- trip duration
+Before predicting each event, the ranker receives a profile built only from **earlier high-intent events**. The current event is added afterward.
 
-### Pairwise / interaction features
+This avoids the common leakage bug where a full-history aggregate contains the very interaction being predicted.
 
-- interest/category match
-- explicit tag overlap
-- budget fit
-- mobility fit
-- family fit
-- localness interaction for travelers requesting local/less-touristy POIs
-- historical category affinity
-- historical tag affinity
-- historical localness/popularity similarity
-- history strength
+At serving time, the profile naturally uses all behavior known up to request time.
 
-Explicit preferences and implicit behavior are kept distinct in feature construction, then learned jointly by the ranker.
+## 5. Ranking objective
 
-## 5. Model selection
+The original pointwise regressor predicted raw signal strength, while evaluation later treated `signal >= 0.60` as relevant. That objective mismatch hurt ranking.
 
-The prototype uses `HistGradientBoostingRegressor` as a pointwise ranking model. This was selected because the problem is heterogeneous tabular data, the dataset is intentionally small, CPU inference is cheap, nonlinear feature interactions matter, and complexity is lower than neural/two-tower approaches.
+The improved `HistGradientBoostingClassifier` directly predicts the probability of a **high-intent event**. Dismissals and strong conversions receive larger sample weights.
 
-For a production system with much larger interaction volume, I would compare this baseline against pairwise/listwise learning-to-rank and a two-tower retrieval model.
+Because behavior is sparse, the learned probability is blended with a transparent prior:
 
-## 6. Training methodology
+`preference = 0.30 * learned_probability + 0.70 * content_history_prior`
 
-Historical traveler–POI events are converted to graded implicit targets:
+This intentionally favors robust cold-start behavior in the small prototype.
 
-- view 0.15
-- click 0.30
-- save 0.60
-- navigate 0.75
-- visit 0.90
-- booking 1.00
-- dismiss -0.70
+## 6. Candidate generation
 
-Each interaction becomes one traveler–POI training pair. Historical user-profile features are aggregated from positive interactions. The model predicts a raw utility signal which is transformed to a bounded preference score for downstream combination.
+Candidate retrieval uses three lanes:
 
-The demo already uses a chronological holdout at evaluation time. A production implementation should additionally make every aggregated feature event-time-correct, use impression-aware negatives, and reserve a separate validation window for tuning.
+- primary relevance lane: interest, budget, quality, local/famous preference fit
+- long-tail lane: interest relevance + inverse popularity
+- exploration/quality lane
 
-## 7. Candidate generation
+The holdout achieves **1.00 candidate recall**, meaning ranking—not retrieval—is the remaining bottleneck on the synthetic benchmark.
 
-Candidate generation combines interest relevance, budget fit, quality and localness. A dedicated long-tail lane fills approximately 25% of the candidate budget from lower-popularity POIs that still match interests.
+## 7. Context scoring
 
-This is important because a ranker cannot recover a relevant POI that retrieval eliminated. Long-tail preservation must therefore happen before ranking, not merely as a post-ranking diversity adjustment.
+Context compatibility remains separate:
 
-At large scale, the retrieval stage would evolve to multiple candidate sources: ANN/two-tower semantic retrieval, collaborative candidates, destination/category indexes, exploration/long-tail source, and business/context rules followed by union + deduplication.
-
-## 8. Ranking and scoring
-
-The learned model estimates **preference relevance**. Separately, context compatibility combines:
-
-- budget fit: 32%
-- mobility fit: 28%
-- party/family fit: 20%
+- budget: 32%
+- mobility: 28%
+- family/party fit: 20%
 - availability: 20%
 
-Final utility combines 68% preference and 32% compatibility. Closed/unavailable POIs are strongly demoted by a multiplicative guardrail.
+Availability also applies a multiplicative guardrail to final utility.
 
-The separation is intentional: a user can strongly prefer a POI while the system can still communicate that it is unsuitable for the current trip.
+## 8. Offline evaluation
 
-## 9. Evaluation
+Interactions are split chronologically per traveler: 75% train, 25% test.
 
-The runnable demo performs a per-user chronological 75/25 split. The ranker and historical profiles are fit only on the earlier interactions; Precision@10, Recall@10 and NDCG@10 are computed against high-strength held-out interactions (`signal >= 0.6`). It additionally measures:
+During holdout evaluation, POIs already seen in training are excluded from candidate generation. This prevents the metric from rewarding memorized historical items when the task is future discovery.
 
-- personalization: mean pairwise Jaccard distance between top-10 lists
-- catalog coverage@10
-- long-tail share@10 (popularity < 0.35)
-- constraint compatibility@10 (context score >= 0.70)
+Reported metrics:
+
+- Precision@5 / @10
+- Recall@5 / @10
+- NDCG@5 / @10
+- candidate recall
+- popularity baseline NDCG@10
+- NDCG lift over popularity
+- personalization
+- catalog coverage
+- long-tail exposure
+- context compatibility
 - intra-list category diversity
 
-### Important evaluation caveat
+Current seed-42 results:
 
-Because this is synthetic implicit-feedback data, the numerical metrics validate pipeline behavior rather than estimate real-world CTR/booking uplift. Production evaluation would retain chronological holdouts while adding impression logs, propensity-aware counterfactual evaluation where appropriate, and online A/B tests.
+- Precision@5: **0.284**
+- Recall@5: **0.570**
+- NDCG@5: **0.506**
+- Precision@10: **0.206**
+- Recall@10: **0.833**
+- NDCG@10: **0.610**
+- Popularity baseline NDCG@10: **0.070**
+- Candidate recall: **1.000**
 
-## 10. Cold-start strategy
+The test set has 2.48 relevant POIs per evaluated user on average, which caps mean Precision@10 at 0.248. The system reaches 83.1% of that ceiling.
+
+## 9. Cold start
 
 ### New traveler
-
-Use explicit interests/preferences, destination, budget, party and mobility immediately. Back off to destination/category priors only where explicit evidence is absent. Introduce exploration slots to collect feedback quickly.
+Use explicit destination, interests, preferences, budget, party and mobility. Add controlled exploration to learn quickly.
 
 ### New POI
-
-Content and metadata features make new items rankable without interactions. Apply Bayesian-smoothed quality priors instead of treating missing reviews as low quality. Ensure a controlled exploration quota gives new POIs exposure.
+Content features make new POIs rankable without interactions. Use smoothed quality priors and exploration exposure.
 
 ### New destination
+Start with content/context relevance and global feature relationships, then adapt as destination-specific interactions accumulate.
 
-Rely initially on content/category/context relevance and global behavioral priors. Transfer category/tag embeddings or learned feature relationships across destinations, then adapt as destination-specific interactions arrive.
+## 10. Production evolution
 
-## 11. Production considerations
+A production system would add:
 
-### Scale
-
-Store POI features offline and retrieve candidates from vector/feature indexes. Use multiple retrieval sources and a low-latency ranker service. Cache destination-level candidate pools where safe.
-
-### Offline vs online features
-
-Offline: POI embeddings, popularity windows, smoothed ratings, long-term traveler profile, collaborative statistics.
-
-Online: current trip context, availability/opening hours, live distance/location, session behavior, recent saves/dismissals.
-
-### Serving
-
-Request -> fetch traveler/trip features -> multi-source retrieval -> online feature join -> ranker -> context guardrails -> explanations -> response. Feature contracts should be versioned so training and serving use the same definitions.
-
-### Freshness
-
-Use event-driven or short-TTL updates for opening hours/availability and session signals; scheduled recomputation for popularity and long-term profiles.
-
-### Retraining
-
-Start daily/weekly depending on volume and drift. Trigger retraining or rollback based on data/model drift and business KPIs rather than cadence alone.
-
-### Feedback loop
-
-Log impressions, rank position, clicks, saves, navigation, visits, bookings and dismissals. Impression logging is essential so non-interaction can be interpreted correctly and selection bias can be measured.
-
-### Monitoring
-
-Monitor retrieval recall, NDCG/engagement proxies, feature missingness, latency, candidate-source mix, popularity concentration, catalog coverage, long-tail exposure, constraint violation rate, score calibration, drift, and slices by destination/party/budget/mobility.
-
-## 12. What I would improve with real data
-
-1. Replace synthetic supervision with impression-aware logs.
-2. Use chronological train/validation/test splits.
-3. Compare pointwise baseline with LambdaMART/pairwise ranking.
-4. Add calibrated probability/confidence rather than evidence-strength proxy.
-5. Train semantic/two-tower retrieval for large catalogs.
-6. Tune objective weights against itinerary-planner and business outcomes.
-7. Add fairness/exposure monitoring for suppliers and neighborhoods.
+- impression logging and exposure-aware negatives
+- explicit train/validation/test time windows
+- LambdaMART or pairwise/listwise ranking comparisons
+- calibrated recommendation probabilities
+- ANN/two-tower retrieval for large catalogs
+- online A/B testing
+- monitoring for drift, retrieval recall, latency, popularity concentration, coverage, long-tail exposure and constraint violations
