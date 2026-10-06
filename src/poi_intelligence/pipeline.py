@@ -11,7 +11,7 @@ from .evaluation import precision_at_k, recall_at_k, ndcg_at_k, intra_list_categ
 
 
 class POIRecommendationPipeline:
-    """Two-stage recommender: quota-aware candidate generation + learned preference ranking + context utility."""
+    """Two-stage recommender: multi-lane candidates -> learned preference -> context utility."""
 
     def __init__(self, random_state=42):
         self.ranker = PreferenceRanker(random_state=random_state)
@@ -25,24 +25,30 @@ class POIRecommendationPipeline:
         self.ranker.fit(travelers, pois, interactions)
         return self
 
-    def _candidate_generation(self, traveler, max_candidates=60):
+    def _candidate_generation(self, traveler, max_candidates=72, exclude_poi_ids=None):
         pool = self.pois[self.pois.destination == traveler.destination].copy()
+        if exclude_poi_ids:
+            pool = pool[~pool.poi_id.isin(set(exclude_poi_ids))].copy()
         interests = set(str(traveler.interests).split("|"))
         prefs = set(str(traveler.explicit_preferences).split("|"))
         pool["interest_gate"] = pool.category.isin(interests).astype(float)
         pool["budget_gate"] = (pool.price_level <= traveler.budget_level + 1).astype(float)
         pool["local_gate"] = pool.localness if ({"local","less_touristy"} & prefs) else 0.0
+        pool["famous_gate"] = pool.popularity if ({"famous","landmark"} & prefs) else 0.0
         pool["quality_gate"] = 0.65*(pool.rating/5) + 0.35*np.log1p(pool.review_count)/np.log1p(max(2,pool.review_count.max()))
-        pool["candidate_score"] = 0.46*pool.interest_gate + 0.18*pool.budget_gate + 0.18*pool.quality_gate + 0.18*pool.local_gate
+        pool["candidate_score"] = 0.48*pool.interest_gate + 0.16*pool.budget_gate + 0.14*pool.quality_gate + 0.14*pool.local_gate + 0.08*pool.famous_gate
         n = min(max_candidates, len(pool))
-        main_n = int(n*0.75)
+        if n == 0:
+            return pool
+        main_n = int(n*0.70)
         main = pool.nlargest(main_n, "candidate_score")
         remaining = pool[~pool.poi_id.isin(main.poi_id)]
-        # Dedicated long-tail lane prevents popularity-heavy candidate generation from erasing niche POIs.
-        tail_n = n-main_n
-        tail = remaining.assign(tail_score=0.55*remaining.interest_gate + 0.45*(1-remaining.popularity)).nlargest(tail_n, "tail_score")
-        out = pd.concat([main, tail]).drop_duplicates("poi_id").head(n)
-        return out
+        tail_n = int(n*0.18)
+        tail = remaining.assign(tail_score=0.62*remaining.interest_gate + 0.38*(1-remaining.popularity)).nlargest(tail_n, "tail_score")
+        remaining2 = remaining[~remaining.poi_id.isin(tail.poi_id)]
+        explore_n = n - len(main) - len(tail)
+        explore = remaining2.nlargest(explore_n, "quality_gate")
+        return pd.concat([main, tail, explore]).drop_duplicates("poi_id").head(n)
 
     @staticmethod
     def _context_scores(traveler, candidates):
@@ -58,7 +64,7 @@ class POIRecommendationPipeline:
         practical = 0.32*budget+0.28*mobility+0.20*family+0.20*availability
         return budget, mobility, family, availability, practical
 
-    def recommend(self, traveler_id=None, traveler_override=None, k=10):
+    def recommend(self, traveler_id=None, traveler_override=None, k=10, exclude_poi_ids=None):
         if traveler_override is not None:
             traveler = pd.Series(traveler_override)
             uid = traveler.get("traveler_id", "NEW_USER")
@@ -67,12 +73,11 @@ class POIRecommendationPipeline:
             traveler = self.travelers[self.travelers.traveler_id == traveler_id].iloc[0]
             uid = traveler_id
             profile = self.profiles.get(uid)
-        cand = self._candidate_generation(traveler)
+        cand = self._candidate_generation(traveler, exclude_poi_ids=exclude_poi_ids)
         pref, feats = self.ranker.predict(traveler, cand, profile)
         budget, mobility, family, availability, practical = self._context_scores(traveler, cand)
-        # Preference is dominant; context acts as utility correction. Availability is also a hard guardrail.
-        final = (0.68*pref + 0.32*practical) * (0.35+0.65*availability)
-        confidence = np.clip(0.45 + 0.35*feats.history_strength.to_numpy() + 0.20*np.minimum(1, cand.review_count.to_numpy()/500), 0, 1)
+        final = (0.75*pref + 0.25*practical) * (0.25+0.75*availability)
+        confidence = np.clip(0.40 + 0.40*feats.history_strength.to_numpy() + 0.20*np.minimum(1, cand.review_count.to_numpy()/500), 0, 1)
         result = cand[["poi_id","name","category","subcategory","rating","popularity","localness"]].copy()
         result["preference_score"] = pref
         result["context_compatibility"] = practical
@@ -91,12 +96,20 @@ class POIRecommendationPipeline:
     def _explain(row, traveler):
         reasons=[]
         if row.interest_match > 0.5: reasons.append("matches stated interests")
-        if row.historical_category_affinity > 0.03: reasons.append("consistent with past positive behavior")
+        if row.historical_category_affinity > 0.03: reasons.append("consistent with past high-intent behavior")
         if row.localness > 0.65 and ("local" in str(traveler.explicit_preferences) or "less_touristy" in str(traveler.explicit_preferences)): reasons.append("strong local / less-touristy fit")
         if row.budget_fit > 0.8: reasons.append("within budget")
         if row.mobility_fit > 0.75: reasons.append("mobility-compatible")
         if row.availability == 1: reasons.append("available for the trip context")
         return "; ".join(reasons[:4]) or "balanced preference and practical fit"
+
+    def _popularity_baseline(self, traveler, k=10, exclude_poi_ids=None):
+        pool = self.pois[self.pois.destination == traveler.destination].copy()
+        if exclude_poi_ids:
+            pool = pool[~pool.poi_id.isin(set(exclude_poi_ids))]
+        score = 0.7*pool.popularity.to_numpy(float) + 0.3*(pool.rating.to_numpy(float)/5.0)
+        pool = pool.assign(_score=score).sort_values("_score", ascending=False)
+        return pool.head(k).poi_id.tolist()
 
     def evaluate(self, k=10, eval_interactions=None):
         per_user=[]
@@ -105,31 +118,64 @@ class POIRecommendationPipeline:
         top_long_tail=[]
         compat=[]
         diversities=[]
+        candidate_recalls=[]
+        precision5_ceilings=[]
+        precision10_ceilings=[]
+        relevant_counts=[]
+        holdout_mode = eval_interactions is not None
         evaluation_data = self.interactions if eval_interactions is None else eval_interactions
         for uid, grp in evaluation_data.groupby("traveler_id"):
             positives = grp[grp.signal >= 0.6]
             if len(positives) < 2:
                 continue
-            rec = self.recommend(traveler_id=uid, k=k)
+            traveler = self.travelers[self.travelers.traveler_id == uid].iloc[0]
+            seen = set(self.interactions[self.interactions.traveler_id == uid].poi_id) if holdout_mode else set()
+            candidates = self._candidate_generation(traveler, exclude_poi_ids=seen)
+            relevant = positives.poi_id.tolist()
+            unique_relevant = len(set(relevant))
+            relevant_counts.append(unique_relevant)
+            precision5_ceilings.append(min(5, unique_relevant) / 5.0)
+            precision10_ceilings.append(min(10, unique_relevant) / 10.0)
+            candidate_recalls.append(len(set(candidates.poi_id) & set(relevant))/max(1,unique_relevant))
+            rec = self.recommend(traveler_id=uid, k=k, exclude_poi_ids=seen)
             ids = rec.poi_id.tolist()
             rec_lists.append(ids)
             covered.update(ids)
             rel_map = dict(zip(grp.poi_id, grp.signal))
-            relevant = positives.poi_id.tolist()
+            baseline = self._popularity_baseline(traveler, k=k, exclude_poi_ids=seen)
             per_user.append({
                 "traveler_id": uid,
                 "precision_at_k": precision_at_k(ids,relevant,k),
                 "recall_at_k": recall_at_k(ids,relevant,k),
                 "ndcg_at_k": ndcg_at_k(ids,rel_map,k),
+                "precision_at_5": precision_at_k(ids,relevant,5),
+                "recall_at_5": recall_at_k(ids,relevant,5),
+                "ndcg_at_5": ndcg_at_k(ids,rel_map,5),
+                "baseline_ndcg_at_k": ndcg_at_k(baseline, rel_map, k),
             })
             top_long_tail.extend((rec.popularity < 0.35).astype(float).tolist())
             compat.extend((rec.context_compatibility >= 0.7).astype(float).tolist())
             diversities.append(intra_list_category_diversity(rec.category.tolist()))
         pf=pd.DataFrame(per_user)
+        p5 = float(pf.precision_at_5.mean())
+        p10 = float(pf.precision_at_k.mean())
+        p5_ceiling = float(np.mean(precision5_ceilings)) if precision5_ceilings else 0.0
+        p10_ceiling = float(np.mean(precision10_ceilings)) if precision10_ceilings else 0.0
         summary={
-            "precision_at_10": float(pf.precision_at_k.mean()),
+            "precision_at_5": p5,
+            "recall_at_5": float(pf.recall_at_5.mean()),
+            "ndcg_at_5": float(pf.ndcg_at_5.mean()),
+            "precision_at_5_ceiling": p5_ceiling,
+            "precision_at_5_fraction_of_ceiling": p5 / p5_ceiling if p5_ceiling else 0.0,
+            "precision_at_10": p10,
+            "precision_at_10_ceiling": p10_ceiling,
+            "precision_at_10_fraction_of_ceiling": p10 / p10_ceiling if p10_ceiling else 0.0,
+            "avg_relevant_items_per_test_user": float(np.mean(relevant_counts)) if relevant_counts else 0.0,
             "recall_at_10": float(pf.recall_at_k.mean()),
             "ndcg_at_10": float(pf.ndcg_at_k.mean()),
+            "popularity_baseline_ndcg_at_10": float(pf.baseline_ndcg_at_k.mean()),
+            "ndcg_lift_vs_popularity": float(pf.ndcg_at_k.mean()-pf.baseline_ndcg_at_k.mean()),
+            "candidate_recall": float(np.mean(candidate_recalls)) if candidate_recalls else 0.0,
             "personalization_distance": personalization_jaccard(rec_lists),
             "catalog_coverage_at_10": len(covered)/max(1,len(self.pois)),
             "long_tail_share_at_10": float(np.mean(top_long_tail)) if top_long_tail else 0.0,
