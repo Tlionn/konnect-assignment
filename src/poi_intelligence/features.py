@@ -1,17 +1,7 @@
 from __future__ import annotations
 
-import math
 import numpy as np
 import pandas as pd
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    r = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2-lat1)
-    dl = math.radians(lon2-lon1)
-    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return 2*r*math.asin(math.sqrt(a))
 
 
 def _set(v):
@@ -20,17 +10,21 @@ def _set(v):
     return set(str(v).split("|"))
 
 
+def empty_profile():
+    return {"category_affinity": {}, "tag_affinity": {}, "local_affinity": 0.5, "popularity_affinity": 0.5, "history_strength": 0.0}
+
+
 def build_user_history_profiles(travelers: pd.DataFrame, pois: pd.DataFrame, interactions: pd.DataFrame):
     merged = interactions.merge(pois[["poi_id","category","tags","localness","popularity"]], on="poi_id", how="left")
     profiles = {}
     for uid, grp in merged.groupby("traveler_id"):
-        pos = grp[grp.signal > 0].copy()
+        # Strong positive events shape long-term preference; weak views/clicks do not.
+        pos = grp[grp.signal >= 0.6].copy()
         if pos.empty:
-            profiles[uid] = {"category_affinity": {}, "tag_affinity": {}, "local_affinity": 0.5, "popularity_affinity": 0.5, "history_strength": 0.0}
+            profiles[uid] = empty_profile()
             continue
         weights = pos.signal.to_numpy(float)
-        cat = {}
-        tag = {}
+        cat, tag = {}, {}
         for (_, row), w in zip(pos.iterrows(), weights):
             cat[row.category] = cat.get(row.category, 0.0) + float(w)
             for tg in _set(row.tags):
@@ -44,7 +38,7 @@ def build_user_history_profiles(travelers: pd.DataFrame, pois: pd.DataFrame, int
             "tag_affinity": tag,
             "local_affinity": float(np.average(pos.localness, weights=weights)),
             "popularity_affinity": float(np.average(pos.popularity, weights=weights)),
-            "history_strength": min(1.0, len(pos)/12.0),
+            "history_strength": min(1.0, len(pos)/8.0),
         }
     return profiles
 
@@ -66,7 +60,8 @@ def pair_features(traveler: pd.Series, poi: pd.Series, history_profile: dict | N
     family_fit = float(poi.family_friendly) if traveler.party_type == "family" else 0.7
     long_tail = 1.0 - float(poi.popularity)
     explicit_local = 1.0 if ({"local", "less_touristy"} & prefs) else 0.0
-    history_profile = history_profile or {}
+    explicit_famous = 1.0 if ({"famous", "landmark"} & prefs) else 0.0
+    history_profile = history_profile or empty_profile()
     hist_cat = float(history_profile.get("category_affinity", {}).get(poi.category, 0.0))
     hist_tag = sum(float(history_profile.get("tag_affinity", {}).get(t, 0.0)) for t in tags)
     hist_strength = float(history_profile.get("history_strength", 0.0))
@@ -84,11 +79,13 @@ def pair_features(traveler: pd.Series, poi: pd.Series, history_profile: dict | N
         "localness": float(poi.localness),
         "long_tail": long_tail,
         "explicit_local_x_localness": explicit_local*float(poi.localness),
+        "explicit_famous_x_popularity": explicit_famous*float(poi.popularity),
         "historical_category_affinity": hist_cat,
         "historical_tag_affinity": min(1.0, hist_tag),
         "history_strength": hist_strength,
         "history_local_similarity": local_affinity*hist_strength,
         "history_popularity_similarity": popularity_affinity*hist_strength,
+        "interest_x_history": interest_match * (0.25 + hist_cat),
         "duration_fit": 1.0 if float(poi.expected_duration_min) <= max(120, float(traveler.trip_duration_days)*90) else 0.6,
         "reservation_friction": 0.0 if not bool(poi.reservation_required) else 1.0,
         "weekend_open": 1.0 if bool(poi.open_weekend) else 0.0,
