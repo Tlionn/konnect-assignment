@@ -2,140 +2,151 @@
 
 ## 1. Problem formulation
 
-Given traveler `u`, trip context `c`, and destination POIs `P`, return a weighted ranking for downstream itinerary planning.
+Given traveler `u`, trip context `c`, and destination POIs `P`, produce a personalized ranked POI list for a downstream itinerary planner.
 
-The system separates:
+Two scores are intentionally separated:
 
-1. **Preference relevance** — likelihood the traveler meaningfully wants the POI.
-2. **Context compatibility** — whether it is practical for this trip.
+- **preference relevance**: how likely the traveler is to value the POI;
+- **context compatibility**: whether the POI is practical for this trip.
 
-Final utility:
+Final utility combines preference and compatibility and applies an availability guardrail.
 
-`final = (0.75 * preference + 0.25 * compatibility) * availability_guardrail`
+## 2. Data and representations
 
-## 2. Synthetic data
+The deterministic synthetic dataset contains 168 POIs, 90 travelers and 1,800 implicit-feedback events across Seoul and Busan.
 
-The deterministic dataset contains:
+POI features include category/subcategory, tags, rating, review volume, price, popularity, localness, accessibility, transit, family suitability, duration, reservation friction and availability.
 
-- 168 POIs across Seoul and Busan
-- 90 travelers
-- 1,800 implicit feedback events
+Traveler features include destination, trip duration, explicit interests/preferences, budget, party type and mobility.
 
-Signals:
+Interaction signals are graded:
 
-- view = 0.15
-- click = 0.30
-- save = 0.60
-- navigate = 0.75
-- visit = 0.90
-- booking = 1.00
-- dismiss = -0.70
+- view 0.15
+- click 0.30
+- save 0.60
+- navigate 0.75
+- visit 0.90
+- booking 1.00
+- dismiss -0.70
 
-Synthetic metrics demonstrate system behavior and evaluation mechanics; they are not claims of real-world business lift.
+## 3. Leakage-safe historical features
 
-## 3. Feature engineering
+Training rows are processed chronologically per traveler.
 
-POI features include quality, popularity, localness, price, transit/accessibility, duration, reservation friction and availability.
+Before scoring each interaction, the user profile contains only earlier high-intent events. The current interaction is added afterward.
 
-Traveler/trip features include interests, explicit preference tags, budget, mobility, party type and trip duration.
+This avoids target leakage from full-history aggregates.
 
-Pair features include interest match, preference overlap, budget/mobility/family fit, explicit local/famous interactions, historical category/tag affinities, and similarity to historical localness/popularity preferences.
-
-## 4. Leakage-safe behavioral history
-
-Training interactions are processed chronologically per traveler.
-
-Before predicting each event, the ranker receives a profile built only from **earlier high-intent events**. The current event is added afterward.
-
-This avoids the common leakage bug where a full-history aggregate contains the very interaction being predicted.
-
-At serving time, the profile naturally uses all behavior known up to request time.
-
-## 5. Ranking objective
-
-The original pointwise regressor predicted raw signal strength, while evaluation later treated `signal >= 0.60` as relevant. That objective mismatch hurt ranking.
-
-The improved `HistGradientBoostingClassifier` directly predicts the probability of a **high-intent event**. Dismissals and strong conversions receive larger sample weights.
-
-Because behavior is sparse, the learned probability is blended with a transparent prior:
-
-`preference = 0.30 * learned_probability + 0.70 * content_history_prior`
-
-This intentionally favors robust cold-start behavior in the small prototype.
-
-## 6. Candidate generation
+## 4. Candidate generation
 
 Candidate retrieval uses three lanes:
 
-- primary relevance lane: interest, budget, quality, local/famous preference fit
-- long-tail lane: interest relevance + inverse popularity
-- exploration/quality lane
+1. primary interest/budget/quality relevance;
+2. long-tail/local discovery;
+3. exploration/quality.
 
-The holdout achieves **1.00 candidate recall**, meaning ranking—not retrieval—is the remaining bottleneck on the synthetic benchmark.
+This prevents popularity-heavy retrieval from eliminating niche neighborhood experiences before ranking.
 
-## 7. Context scoring
+On the final holdout, candidate recall is 1.0.
 
-Context compatibility remains separate:
+## 5. Model selection
 
-- budget: 32%
-- mobility: 28%
+A temporal 60/15/25 split is used for model selection.
+
+Compared approaches:
+
+- content/history heuristic;
+- Logistic Regression;
+- HistGradientBoosting;
+- LambdaMART-style XGBoost learning-to-rank.
+
+Regularized Logistic Regression (`C=2`) has the best validation NDCG@10 and is selected.
+
+This result is consistent with the small sparse tabular regime: lower-variance linear decision boundaries generalize better than more expressive models.
+
+## 6. Preference ranking
+
+The selected model predicts the probability of a high-intent event (`signal >= 0.6`) using explicit, contextual and historical pair features.
+
+Important features include:
+
+- interest/category match;
+- interest × history interaction;
+- explicit tag overlap;
+- explicit localness interaction;
+- budget fit;
+- historical localness/popularity affinity;
+- accessibility and family fit.
+
+The standardized coefficients are written to `reports/feature_coefficients.csv`.
+
+## 7. Context compatibility
+
+Practical compatibility is scored independently from preference:
+
+- budget fit: 32%
+- mobility fit: 28%
 - family/party fit: 20%
 - availability: 20%
 
-Availability also applies a multiplicative guardrail to final utility.
+The serving utility is:
 
-## 8. Offline evaluation
+`utility = (0.75 * preference + 0.25 * compatibility) * availability_guardrail`
 
-Interactions are split chronologically per traveler: 75% train, 25% test.
+This allows a POI to be highly preferred while still being demoted for the current trip.
 
-During holdout evaluation, POIs already seen in training are excluded from candidate generation. This prevents the metric from rewarding memorized historical items when the task is future discovery.
+## 8. Evaluation
 
-Reported metrics:
+Holdout evaluation uses the final 25% of each user timeline after model selection is complete. POIs already seen in the fit window are excluded.
 
-- Precision@5 / @10
-- Recall@5 / @10
-- NDCG@5 / @10
-- candidate recall
-- popularity baseline NDCG@10
-- NDCG lift over popularity
-- personalization
-- catalog coverage
-- long-tail exposure
-- context compatibility
-- intra-list category diversity
+Preference-ranking results:
 
-Current seed-42 results:
+- Precision@5: 0.352
+- Recall@5: 0.700
+- NDCG@5: 0.628
+- Precision@10: 0.226
+- Recall@10: 0.910
+- NDCG@10: 0.709
 
-- Precision@5: **0.284**
-- Recall@5: **0.570**
-- NDCG@5: **0.506**
-- Precision@10: **0.206**
-- Recall@10: **0.833**
-- NDCG@10: **0.610**
-- Popularity baseline NDCG@10: **0.070**
-- Candidate recall: **1.000**
+Additional diagnostics:
 
-The test set has 2.48 relevant POIs per evaluated user on average, which caps mean Precision@10 at 0.248. The system reaches 83.1% of that ceiling.
+- candidate recall: 1.000
+- popularity baseline NDCG@10: 0.070
+- personalization distance: 0.936
+- catalog coverage@10: 0.720
+- long-tail share@10: 0.438
+- constraint compatibility@10: 0.866
 
-## 9. Cold start
+Final context-adjusted utility is reported separately: NDCG@10 = 0.650.
+
+## 9. Precision ceiling
+
+The test set has only 2.48 relevant items per evaluated user on average, so mean Precision@10 cannot exceed 0.248. The model reaches 0.226, or 91.1% of that ceiling.
+
+## 10. Failure analysis
+
+The weakest cases show three main patterns:
+
+- held-out behavior conflicts with explicit traveler interests;
+- long-tail items have insufficient evidence to rank high;
+- all relevant items are retrieved but graded order is imperfect.
+
+These are documented in `reports/failure_analysis.csv`.
+
+## 11. Cold start
 
 ### New traveler
-Use explicit destination, interests, preferences, budget, party and mobility. Add controlled exploration to learn quickly.
+
+Use explicit interests, destination, budget, party and mobility immediately. Historical features default to neutral values. Controlled exploration collects evidence.
 
 ### New POI
-Content features make new POIs rankable without interactions. Use smoothed quality priors and exploration exposure.
+
+Content/context features make new items rankable without interactions. Use smoothed quality priors and exploration exposure.
 
 ### New destination
-Start with content/context relevance and global feature relationships, then adapt as destination-specific interactions accumulate.
 
-## 10. Production evolution
+Start with content/context relevance and global feature relationships, then adapt as destination-specific feedback accumulates.
 
-A production system would add:
+## 12. Production design
 
-- impression logging and exposure-aware negatives
-- explicit train/validation/test time windows
-- LambdaMART or pairwise/listwise ranking comparisons
-- calibrated recommendation probabilities
-- ANN/two-tower retrieval for large catalogs
-- online A/B testing
-- monitoring for drift, retrieval recall, latency, popularity concentration, coverage, long-tail exposure and constraint violations
+See `docs/production_architecture.md` for the feature-store split, online serving path, feedback loop, freshness, retraining and monitoring strategy.
