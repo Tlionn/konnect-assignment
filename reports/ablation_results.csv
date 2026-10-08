@@ -1,0 +1,7 @@
+variant,surface,precision_at_10,recall_at_10,ndcg_at_10,users
+Logistic + context guardrails,final utility,0.206,0.835,0.6499812348566187,50
+Logistic Regression (selected),preference relevance,0.22599999999999995,0.91,0.7094887482861715,50
+Content/history scorer,preference relevance,0.21199999999999997,0.8483333333333334,0.656496003973274,50
+HistGradientBoosting,preference relevance,0.17800000000000002,0.7216666666666666,0.4800209094793194,50
+LambdaMART LTR,preference relevance,0.17799999999999996,0.71,0.3924895391626341,50
+Popularity baseline,preference relevance,0.027999999999999997,0.11333333333333333,0.07044590044456102,50
