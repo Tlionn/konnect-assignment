@@ -1,0 +1,6 @@
+traveler_id,ndcg_at_10,interests,explicit_preferences,relevant_items,recommended_hits,misses,diagnosis
+U031,0.05547174176634616,food|neighborhood,less_touristy|local,P0136|P0109,,P0109|P0136,held-out behavior conflicts with explicit interest profile
+U072,0.21762061289180137,shopping|food,local|market,P0001|P0048,P0001,P0048,held-out behavior conflicts with explicit interest profile; missed positive is unusually long-tail
+U050,0.29710426944292995,history|culture,famous|architecture,P0032|P0024|P0015,P0015|P0024,P0032,rank-order error among retrievable relevant candidates
+U074,0.3431356642939272,history|culture,famous|architecture,P0024|P0021,P0021|P0024,,all positives retrieved; NDCG loss is graded ordering
+U044,0.410767469321607,history|culture,famous|architecture,P0023|P0027,P0023|P0027,,all positives retrieved; NDCG loss is graded ordering
