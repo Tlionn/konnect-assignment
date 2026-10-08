@@ -13,9 +13,10 @@ from .evaluation import precision_at_k, recall_at_k, ndcg_at_k, intra_list_categ
 class POIRecommendationPipeline:
     """Two-stage recommender: multi-lane candidates -> learned preference -> context utility."""
 
-    def __init__(self, random_state=42):
+    def __init__(self, random_state=42, context_weight=0.25):
         self.ranker = PreferenceRanker(random_state=random_state)
         self.profiles = {}
+        self.context_weight = context_weight
 
     def fit(self, travelers, pois, interactions):
         self.travelers = travelers.copy()
@@ -64,7 +65,7 @@ class POIRecommendationPipeline:
         practical = 0.32*budget+0.28*mobility+0.20*family+0.20*availability
         return budget, mobility, family, availability, practical
 
-    def recommend(self, traveler_id=None, traveler_override=None, k=10, exclude_poi_ids=None):
+    def recommend(self, traveler_id=None, traveler_override=None, k=10, exclude_poi_ids=None, ranking="utility"):
         if traveler_override is not None:
             traveler = pd.Series(traveler_override)
             uid = traveler.get("traveler_id", "NEW_USER")
@@ -76,7 +77,8 @@ class POIRecommendationPipeline:
         cand = self._candidate_generation(traveler, exclude_poi_ids=exclude_poi_ids)
         pref, feats = self.ranker.predict(traveler, cand, profile)
         budget, mobility, family, availability, practical = self._context_scores(traveler, cand)
-        final = (0.75*pref + 0.25*practical) * (0.25+0.75*availability)
+        final = ((1-self.context_weight)*pref + self.context_weight*practical) * (0.25+0.75*availability)
+        rank_score = pref if ranking == "preference" else final
         confidence = np.clip(0.40 + 0.40*feats.history_strength.to_numpy() + 0.20*np.minimum(1, cand.review_count.to_numpy()/500), 0, 1)
         result = cand[["poi_id","name","category","subcategory","rating","popularity","localness"]].copy()
         result["preference_score"] = pref
@@ -88,7 +90,8 @@ class POIRecommendationPipeline:
         result["availability"] = availability
         result["interest_match"] = feats.interest_match.to_numpy()
         result["historical_category_affinity"] = feats.historical_category_affinity.to_numpy()
-        result = result.sort_values("final_score", ascending=False).head(k).reset_index(drop=True)
+        result["_rank_score"] = rank_score
+        result = result.sort_values("_rank_score", ascending=False).head(k).drop(columns=["_rank_score"]).reset_index(drop=True)
         result["explanation"] = result.apply(lambda r: self._explain(r, traveler), axis=1)
         return result
 
@@ -113,14 +116,13 @@ class POIRecommendationPipeline:
 
     def evaluate(self, k=10, eval_interactions=None):
         per_user=[]
+        utility_rows=[]
         rec_lists=[]
         covered=set()
         top_long_tail=[]
         compat=[]
         diversities=[]
         candidate_recalls=[]
-        precision5_ceilings=[]
-        precision10_ceilings=[]
         relevant_counts=[]
         holdout_mode = eval_interactions is not None
         evaluation_data = self.interactions if eval_interactions is None else eval_interactions
@@ -134,45 +136,50 @@ class POIRecommendationPipeline:
             relevant = positives.poi_id.tolist()
             unique_relevant = len(set(relevant))
             relevant_counts.append(unique_relevant)
-            precision5_ceilings.append(min(5, unique_relevant) / 5.0)
-            precision10_ceilings.append(min(10, unique_relevant) / 10.0)
             candidate_recalls.append(len(set(candidates.poi_id) & set(relevant))/max(1,unique_relevant))
-            rec = self.recommend(traveler_id=uid, k=k, exclude_poi_ids=seen)
-            ids = rec.poi_id.tolist()
-            rec_lists.append(ids)
-            covered.update(ids)
+            pref_rec = self.recommend(traveler_id=uid, k=k, exclude_poi_ids=seen, ranking="preference")
+            util_rec = self.recommend(traveler_id=uid, k=k, exclude_poi_ids=seen, ranking="utility")
+            pref_ids = pref_rec.poi_id.tolist()
+            util_ids = util_rec.poi_id.tolist()
             rel_map = dict(zip(grp.poi_id, grp.signal))
             baseline = self._popularity_baseline(traveler, k=k, exclude_poi_ids=seen)
             per_user.append({
                 "traveler_id": uid,
-                "precision_at_k": precision_at_k(ids,relevant,k),
-                "recall_at_k": recall_at_k(ids,relevant,k),
-                "ndcg_at_k": ndcg_at_k(ids,rel_map,k),
-                "precision_at_5": precision_at_k(ids,relevant,5),
-                "recall_at_5": recall_at_k(ids,relevant,5),
-                "ndcg_at_5": ndcg_at_k(ids,rel_map,5),
+                "precision_at_k": precision_at_k(pref_ids,relevant,k),
+                "recall_at_k": recall_at_k(pref_ids,relevant,k),
+                "ndcg_at_k": ndcg_at_k(pref_ids,rel_map,k),
+                "precision_at_5": precision_at_k(pref_ids,relevant,5),
+                "recall_at_5": recall_at_k(pref_ids,relevant,5),
+                "ndcg_at_5": ndcg_at_k(pref_ids,rel_map,5),
                 "baseline_ndcg_at_k": ndcg_at_k(baseline, rel_map, k),
             })
-            top_long_tail.extend((rec.popularity < 0.35).astype(float).tolist())
-            compat.extend((rec.context_compatibility >= 0.7).astype(float).tolist())
-            diversities.append(intra_list_category_diversity(rec.category.tolist()))
+            utility_rows.append((
+                precision_at_k(util_ids,relevant,k),
+                recall_at_k(util_ids,relevant,k),
+                ndcg_at_k(util_ids,rel_map,k),
+            ))
+            rec_lists.append(util_ids)
+            covered.update(util_ids)
+            top_long_tail.extend((util_rec.popularity < 0.35).astype(float).tolist())
+            compat.extend((util_rec.context_compatibility >= 0.7).astype(float).tolist())
+            diversities.append(intra_list_category_diversity(util_rec.category.tolist()))
         pf=pd.DataFrame(per_user)
-        p5 = float(pf.precision_at_5.mean())
-        p10 = float(pf.precision_at_k.mean())
-        p5_ceiling = float(np.mean(precision5_ceilings)) if precision5_ceilings else 0.0
-        p10_ceiling = float(np.mean(precision10_ceilings)) if precision10_ceilings else 0.0
+        ua=np.asarray(utility_rows,float)
+        p10=float(pf.precision_at_k.mean())
+        p10_ceiling=float(np.mean([min(k,n)/k for n in relevant_counts])) if relevant_counts else 0.0
         summary={
-            "precision_at_5": p5,
+            "precision_at_5": float(pf.precision_at_5.mean()),
             "recall_at_5": float(pf.recall_at_5.mean()),
             "ndcg_at_5": float(pf.ndcg_at_5.mean()),
-            "precision_at_5_ceiling": p5_ceiling,
-            "precision_at_5_fraction_of_ceiling": p5 / p5_ceiling if p5_ceiling else 0.0,
             "precision_at_10": p10,
             "precision_at_10_ceiling": p10_ceiling,
-            "precision_at_10_fraction_of_ceiling": p10 / p10_ceiling if p10_ceiling else 0.0,
+            "precision_at_10_fraction_of_ceiling": p10/p10_ceiling if p10_ceiling else 0.0,
             "avg_relevant_items_per_test_user": float(np.mean(relevant_counts)) if relevant_counts else 0.0,
             "recall_at_10": float(pf.recall_at_k.mean()),
             "ndcg_at_10": float(pf.ndcg_at_k.mean()),
+            "utility_precision_at_10": float(ua[:,0].mean()) if len(ua) else 0.0,
+            "utility_recall_at_10": float(ua[:,1].mean()) if len(ua) else 0.0,
+            "utility_ndcg_at_10": float(ua[:,2].mean()) if len(ua) else 0.0,
             "popularity_baseline_ndcg_at_10": float(pf.baseline_ndcg_at_k.mean()),
             "ndcg_lift_vs_popularity": float(pf.ndcg_at_k.mean()-pf.baseline_ndcg_at_k.mean()),
             "candidate_recall": float(np.mean(candidate_recalls)) if candidate_recalls else 0.0,
